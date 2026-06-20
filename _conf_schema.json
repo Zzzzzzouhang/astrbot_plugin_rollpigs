@@ -1,0 +1,32 @@
+{
+  "resource_sync_enabled": {
+    "description": "是否启用云端小猪资源同步",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后插件会在启动时及定时从云端同步最新的小猪资源包（pig.json 和图片），关闭则仅使用内置资源。"
+  },
+  "resource_manifest_url": {
+    "description": "云端资源 manifest URL",
+    "type": "string",
+    "default": "https://pig.felislab.cc/resources/rollpig/manifest.json",
+    "hint": "云端资源包的 manifest.json 地址。如需使用自己的资源站点，可修改为自己的 manifest 地址。"
+  },
+  "resource_sync_interval_hours": {
+    "description": "资源同步间隔（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "定时同步云端资源的间隔时间，最小为 1 小时。"
+  },
+  "resource_sync_timeout": {
+    "description": "资源同步超时时间（秒）",
+    "type": "float",
+    "default": 10.0,
+    "hint": "单次网络请求的超时时间。"
+  },
+  "resource_max_file_size": {
+    "description": "资源文件最大大小（字节）",
+    "type": "int",
+    "default": 10485760,
+    "hint": "单个资源文件的最大允许大小，默认 10MB。超过此大小的文件将被拒绝。"
+  }
+}
