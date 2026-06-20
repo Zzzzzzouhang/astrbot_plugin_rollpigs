@@ -813,7 +813,7 @@ class RollPigPlugin(Star):
             return False
 
         try:
-            await event.send(event.image_result(img_path))
+            await event.send(event.image_result(str(img_path)))
             logger.info("今日小猪合成图片发送成功")
             return True
         except Exception as error:
