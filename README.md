@@ -3,6 +3,9 @@
     <p>今天是什么小猪 🐽</p>
 </div>
 
+> **本项目移植自 NoneBot 插件 [nonebot-plugin-rollpig](https://github.com/Bearlele/nonebot-plugin-rollpig)，将其适配为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件框架。**
+> **感谢原作者 [Bearlele](https://github.com/Bearlele) 的出色工作。**
+
 ---
 
 ### ✨ 特性 ✨
