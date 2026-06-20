@@ -9,12 +9,12 @@ astrbot_plugin_rollpigs - 今天是什么小猪
 """
 
 import asyncio
-import base64
 import hashlib
 import json
 import random
 import re
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,6 +23,8 @@ from typing import Any, Optional
 from urllib.parse import urljoin
 
 import httpx
+from PIL import Image as PILImage
+from PIL import ImageDraw, ImageFont
 from pydantic import BaseModel
 
 from astrbot.api import AstrBotConfig, logger
@@ -38,6 +40,7 @@ PLUGIN_DIR = Path(__file__).parent
 BUILTIN_RESOURCE_DIR = PLUGIN_DIR / "resource"
 BUILTIN_PIG_JSON = BUILTIN_RESOURCE_DIR / "pig.json"
 BUILTIN_IMAGE_DIR = BUILTIN_RESOURCE_DIR / "image"
+BUILTIN_FONT_DIR = BUILTIN_RESOURCE_DIR / "font"
 
 # 持久化数据目录 (data 目录下，防止插件更新时数据丢失)
 DATA_DIR = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
@@ -463,11 +466,12 @@ class Pigsty:
             return []
         return random.sample(self.pigs, min(count, len(self.pigs)))
 
-    def catch_today_pig(self) -> Pigsonality:
-        """随机选一只今日猪格。"""
+    def catch_today_pig(self, exclude_id: Optional[str] = None) -> Pigsonality:
+        """随机选一只今日猪格；可传入上次抽到的 id 以避免重复。"""
         if not self.pig_pool:
             self._load_pigsonalities()
-        return random.choice(self.pig_pool)
+        candidates = [p for p in self.pig_pool if p.id != exclude_id] or self.pig_pool
+        return random.choice(candidates)
 
     def get_pigsonality_img(self, pig_id: str) -> Optional[Path]:
         """获取指定猪格的图片文件路径。"""
@@ -501,6 +505,19 @@ class RollPigPlugin(Star):
     - 同步小猪资源 (仅管理员，别名: 刷新小猪图鉴)
     """
 
+    # ================================ 渲染布局常量 ================================ #
+    CANVAS_WIDTH = 800  # 画布宽度
+    CANVAS_HEIGHT = 800  # 画布高度
+    AVATAR_SIZE = 280  # 头像大小
+    SPACING_AVATAR_NAME = 20  # 头像与名称间距
+    SPACING_NAME_DESC = 25  # 名称与描述间距
+    SPACING_DESC_ANALYSIS = 30  # 描述与解析间距
+    NAME_FONT_SIZE = 66  # 名称字体大小
+    DESC_FONT_SIZE = 32  # 描述字体大小
+    ANALYSIS_FONT_SIZE = 28  # 解析字体大小
+    ANALYSIS_LINE_HEIGHT_FACTOR = 1.6  # 解析行高因子
+    ANALYSIS_WIDTH_RATIO = 0.85  # 解析宽度比例
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
@@ -512,21 +529,15 @@ class RollPigPlugin(Star):
         self.resource_manager = RollPigResourceManager(config)
         self.pigsty = Pigsty(self.resource_manager, RECORDS_PATH)
 
-        # HTML 模板 (在 initialize 中加载)
-        self._template_html: str = ""
+        # 初始化字体（优先插件内置字体，跨平台兼容回退）
+        self.font_regular = self._init_regular_font()  # 常规字体（描述/解析）
+        self.font_bold = self._init_bold_font()  # 加粗字体（名称）
 
         # 后台任务引用
         self._bg_tasks: list[asyncio.Task] = []
 
     async def initialize(self):
         """插件启动：加载模板、资源，启动后台定时任务。"""
-        # 加载 HTML 模板
-        template_path = BUILTIN_RESOURCE_DIR / "template.html"
-        if template_path.exists():
-            self._template_html = template_path.read_text(encoding="utf-8")
-        else:
-            logger.warning(f"未找到模板文件: {template_path}")
-
         # 加载资源
         self.resource_manager.reload()
 
@@ -600,72 +611,236 @@ class RollPigPlugin(Star):
 
     # ================================ 辅助方法 ================================ #
 
-    async def _render_pig_image(self, pig_data: Pigsonality) -> Optional[str]:
-        """
-        将猪格数据渲染为图片 URL。
-        使用 AstrBot 的 html_render 方法，本地图片转为 base64 data URI。
-        """
-        if not self._template_html:
-            return None
+    # ---- 字体加载 ----
 
-        # 获取头像文件并转为 base64 data URI
-        avatar_uri = ""
-        avatar_file = self.pigsty.get_pigsonality_img(pig_data.id)
-        if avatar_file:
-            suffix = avatar_file.suffix.lower().lstrip(".")
-            mime = {
-                "png": "image/png",
-                "jpg": "image/jpeg",
-                "jpeg": "image/jpeg",
-                "gif": "image/gif",
-                "webp": "image/webp",
-            }.get(suffix, "image/png")
-            b64 = base64.b64encode(avatar_file.read_bytes()).decode("ascii")
-            avatar_uri = f"data:{mime};base64,{b64}"
-        else:
-            logger.warning(f"未找到图片: {pig_data.id}.*")
+    def _load_font(
+        self, font_candidates: list[Path], size: int, purpose: str
+    ) -> ImageFont.FreeTypeFont:
+        """按候选顺序加载可用字体，全部失败则回退到 PIL 默认字体。"""
+        for font_path in font_candidates:
+            if Path(font_path).exists():
+                try:
+                    return ImageFont.truetype(str(font_path), size)
+                except Exception as error:
+                    logger.warning(f"加载{purpose}字体 {font_path} 失败：{error}")
+                    continue
+        logger.warning(f"未找到{purpose}字体，使用默认字体")
+        return ImageFont.load_default()
 
-        # 使用 AstrBot html_render 渲染 Jinja2 HTML 模板为图片
+    def _init_regular_font(self) -> ImageFont.FreeTypeFont:
+        """初始化常规字体（可爱字体，用于描述/解析）。"""
+        return self._load_font(
+            [
+                BUILTIN_FONT_DIR / "可爱字体.ttf",
+                BUILTIN_FONT_DIR / "SourceHanSansCN-Regular.otf",
+                Path("C:/Windows/Fonts/msyh.ttc"),
+                Path("C:/Windows/Fonts/simhei.ttf"),
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                Path("/System/Library/Fonts/PingFang.ttc"),
+            ],
+            self.DESC_FONT_SIZE,
+            "常规",
+        )
+
+    def _init_bold_font(self) -> ImageFont.FreeTypeFont:
+        """初始化加粗字体（荆南麦圆体，用于名称）。"""
+        return self._load_font(
+            [
+                BUILTIN_FONT_DIR / "荆南麦圆体.otf",
+                BUILTIN_FONT_DIR / "SourceHanSansCN-Bold.otf",
+                Path("C:/Windows/Fonts/msyhbd.ttc"),
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+                Path("/System/Library/Fonts/PingFang.ttc"),
+            ],
+            self.NAME_FONT_SIZE,
+            "加粗",
+        )
+
+    # ---- 绘制工具 ----
+
+    @staticmethod
+    def _get_text_size(
+        text: str, font: ImageFont.FreeTypeFont
+    ) -> tuple[int, int]:
+        """计算文字宽高（兼容不同版本 PIL）。"""
+        draw = ImageDraw.Draw(PILImage.new("RGB", (1, 1)))
         try:
-            url = await self.html_render(
-                self._template_html,
-                {
-                    "avatar": avatar_uri,
-                    "name": pig_data.name,
-                    "desc": pig_data.description,
-                    "analysis": pig_data.analysis,
-                },
+            bbox = draw.textbbox((0, 0), text, font=font)
+            return (bbox[2] - bbox[0], bbox[3] - bbox[1])
+        except Exception:
+            return draw.textsize(text, font=font)
+
+    @staticmethod
+    def _draw_bold_text(
+        draw: ImageDraw.ImageDraw,
+        pos: tuple[int, int],
+        text: str,
+        font: ImageFont.FreeTypeFont,
+        fill: tuple[int, int, int],
+    ) -> None:
+        """通过四向描边模拟文字加粗（兜底方案）。"""
+        x, y = pos
+        for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            draw.text((x + ox, y + oy), text, fill=fill, font=font)
+        draw.text((x, y), text, fill=fill, font=font)
+
+    # ---- PIL 像素级居中渲染 ----
+
+    def render_pig_image(self, pig_data: Pigsonality) -> Optional[Path]:
+        """
+        将猪格数据渲染为 800x800 图片（水平+垂直双居中）。
+
+        通过预先计算内容总高度并推导起始 Y 坐标实现像素级垂直居中，
+        每个元素再各自水平居中，避免 HTML 渲染在固定画布内居中不可靠的问题。
+        """
+        canvas_w = self.CANVAS_WIDTH
+        canvas_h = self.CANVAS_HEIGHT
+        canvas = PILImage.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        pig_id = pig_data.id
+        pig_name = pig_data.name or "未知小猪"
+        pig_desc = pig_data.description or ""
+        pig_analysis = pig_data.analysis or ""
+
+        # 1. 头像（缩放到 280x280 并居中裁剪为正方形）
+        avatar_w = avatar_h = self.AVATAR_SIZE
+        avatar = None
+        avatar_file = self.pigsty.get_pigsonality_img(pig_id)
+        if avatar_file:
+            try:
+                avatar = PILImage.open(avatar_file)
+                avatar.thumbnail((avatar_w, avatar_h))
+                if avatar.size != (avatar_w, avatar_h):
+                    half = self.AVATAR_SIZE // 2
+                    cx, cy = avatar.width // 2, avatar.height // 2
+                    avatar = avatar.crop((cx - half, cy - half, cx + half, cy + half))
+            except Exception as error:
+                logger.error(f"加载小猪图片失败：{error}")
+                avatar = None
+        else:
+            logger.warning(f"未找到图片: {pig_id}.*")
+
+        # 2. 名称尺寸
+        name_font = self.font_bold
+        name_w, name_h = self._get_text_size(pig_name, name_font)
+
+        # 3. 描述尺寸
+        desc_font = self.font_regular.font_variant(size=self.DESC_FONT_SIZE)
+        desc_w, desc_h = self._get_text_size(pig_desc, desc_font)
+
+        # 4. 解析（按宽度自动换行后计算总高）
+        analysis_font = self.font_regular.font_variant(size=self.ANALYSIS_FONT_SIZE)
+        line_height = int(self.ANALYSIS_FONT_SIZE * self.ANALYSIS_LINE_HEIGHT_FACTOR)
+        max_analysis_width = int(canvas_w * self.ANALYSIS_WIDTH_RATIO)
+        analysis_lines: list[str] = []
+        current_line = ""
+        for char in pig_analysis:
+            current_line += char
+            line_w, _ = self._get_text_size(current_line, analysis_font)
+            if line_w > max_analysis_width:
+                analysis_lines.append(current_line[:-1])
+                current_line = char
+        if current_line:
+            analysis_lines.append(current_line)
+        analysis_total_h = max(len(analysis_lines), 1) * line_height
+
+        # 5. 计算内容总高度 → 垂直居中起始 Y 坐标（核心）
+        total_content_h = (
+            avatar_h
+            + self.SPACING_AVATAR_NAME
+            + name_h
+            + self.SPACING_NAME_DESC
+            + desc_h
+            + self.SPACING_DESC_ANALYSIS
+            + analysis_total_h
+        )
+        start_y = (canvas_h - total_content_h) // 2
+
+        # 6.1 绘制头像（水平+垂直居中）
+        avatar_x = (canvas_w - avatar_w) // 2
+        avatar_y = start_y
+        if avatar:
+            canvas.paste(
+                avatar,
+                (avatar_x, avatar_y),
+                mask=avatar if avatar.mode == "RGBA" else None,
             )
-            return url
+
+        # 6.2 绘制名称（水平居中）
+        name_y = avatar_y + avatar_h + self.SPACING_AVATAR_NAME
+        name_x = (canvas_w - name_w) // 2
+        self._draw_bold_text(draw, (name_x, name_y), pig_name, name_font, (0, 0, 0))
+
+        # 6.3 绘制描述（水平居中）
+        desc_y = name_y + name_h + self.SPACING_NAME_DESC
+        desc_x = (canvas_w - desc_w) // 2
+        draw.text((desc_x, desc_y), pig_desc, fill=(85, 85, 85), font=desc_font)
+
+        # 6.4 绘制解析（逐行水平居中）
+        analysis_y = desc_y + desc_h + self.SPACING_DESC_ANALYSIS
+        for line in analysis_lines:
+            line_w, _ = self._get_text_size(line, analysis_font)
+            line_x = (canvas_w - line_w) // 2
+            draw.text((line_x, analysis_y), line, fill=(51, 51, 51), font=analysis_font)
+            analysis_y += line_height
+
+        # 7. 保存临时文件
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+                canvas.save(tmp_path, format="PNG", quality=95)
+            if not tmp_path.exists():
+                logger.error(f"临时文件创建失败：{tmp_path}")
+                return None
+            return tmp_path
         except Exception as error:
-            logger.error(f"渲染猪格图片失败: {error}")
+            logger.error(f"合成图片失败：{error}")
             return None
+
+    async def _render_pig_image(self, pig_data: Pigsonality) -> Optional[str]:
+        """在线程池中执行 CPU 密集的 PIL 渲染，返回临时图片路径字符串。"""
+        return await asyncio.to_thread(self.render_pig_image, pig_data)
+
+    async def _send_pig_image(self, event: AstrMessageEvent, pig_data: Pigsonality) -> bool:
+        """
+        渲染并发送今日小猪图片。
+
+        成功发送并清理临时文件返回 True；渲染或发送失败返回 False（调用方负责降级）。
+        """
+        img_path = await self._render_pig_image(pig_data)
+        if not img_path or not Path(img_path).exists():
+            return False
+
+        try:
+            await event.send(event.image_result(img_path))
+            logger.info("今日小猪合成图片发送成功")
+            return True
+        except Exception as error:
+            logger.error(f"发送合成图片失败：{error}")
+            return False
+        finally:
+            try:
+                Path(img_path).unlink(missing_ok=True)
+            except Exception as cleanup_err:
+                logger.warning(f"清理临时图片失败：{cleanup_err}")
 
     # ================================ 命令处理器 ================================ #
 
     @filter.command("今日小猪", alias={"今天是什么小猪", "本日小猪", "当日小猪"})
     async def todays_pig(self, event: AstrMessageEvent):
-        """抽取今天属于你的小猪"""
+        """抽取今天属于你的小猪（每次都重新随机一只新的）"""
         user_id = str(event.get_sender_id())
 
-        # 检查今日缓存：如果用户今天已经抽过，直接返回缓存结果
-        today_cache = self.pigsty.check_user_record(user_id)
-        if today_cache:
-            cached_pig = self.pigsty.get_pigsonality_by_id(today_cache.pig_id)
-            if cached_pig:
-                url = await self._render_pig_image(cached_pig)
-                if url:
-                    yield event.image_result(url)
-                    return
+        # 取出上次抽到的小猪 id，避免连续两次抽到同一只
+        last_record = self.pigsty.check_user_record(user_id)
+        exclude_id = last_record.pig_id if last_record else None
 
-        # 没有缓存或缓存失效，抽取新的今日猪
-        pig = self.pigsty.catch_today_pig()
+        # 每次都重新随机一只新的小猪（排除上一只，确保和上次不同）
+        pig = self.pigsty.catch_today_pig(exclude_id=exclude_id)
         await self.pigsty.save_user_record(user_id, pig.id)
 
-        url = await self._render_pig_image(pig)
-        if url:
-            yield event.image_result(url)
-        else:
+        if not await self._send_pig_image(event, pig):
             yield event.plain_result(
                 f"今日小猪：{pig.name}\n{pig.description}\n{pig.analysis}"
             )
