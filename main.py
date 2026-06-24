@@ -59,13 +59,11 @@ ALLOWED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 class PigInfo(BaseModel):
     """PigHub 猪猪信息"""
 
-    id: str
+    id: int
     title: str
-    image_type: str = ""
+    image_url: str = ""
     view_count: int = 0
     download_count: int = 0
-    thumbnail: str = ""
-    duration: str = ""
     filename: str = ""
     mtime: int = 0
 
@@ -426,17 +424,17 @@ class Pigsty:
 
     async def _refresh_pigsty(self) -> None:
         """从 PigHub API 刷新在线猪猪数据。"""
-        url = "https://pighub.top/api/all-images"
+        url = "https://pighub.top/api/images?sort=2"
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(url)
                 response.raise_for_status()
             data = response.json()
-            if data and data.get("images"):
-                self.pigs = [PigInfo(**pig) for pig in data["images"]]
+            if data and data.get("code") == 0 and data.get("data"):
+                self.pigs = [PigInfo(**pig) for pig in data["data"]]
                 logger.info(f"成功从 PigHub 缓存 {len(self.pigs)} 头猪猪")
             else:
-                logger.warning("PigHub 中找不到猪猪")
+                logger.warning(f"PigHub 返回数据异常: {data.get('message', 'unknown')}")
         except Exception as error:
             logger.warning(f"刷新 PigHub 失败: {error}")
 
@@ -860,14 +858,14 @@ class RollPigPlugin(Star):
 
         if len(pigs) == 1:
             pig = pigs[0]
-            image_url = "https://pighub.top/data/" + pig.thumbnail.split("/")[-1]
+            image_url = "https://pighub.top" + pig.image_url
             yield event.image_result(image_url)
             return
 
         # 多张猪猪，用消息链发送
         chain: list = []
         for pig in pigs:
-            image_url = "https://pighub.top/data/" + pig.thumbnail.split("/")[-1]
+            image_url = "https://pighub.top" + pig.image_url
             chain.append(Comp.Plain(f"{pig.title} - {pig.id}\n"))
             chain.append(Comp.Image.fromURL(image_url))
             chain.append(Comp.Plain("\n"))
@@ -902,7 +900,7 @@ class RollPigPlugin(Star):
         # 解析 "id <数字>" 模式
         id_match = re.match(r"^(?:-i|--id|id)\s+(\d+)$", args_text, re.IGNORECASE)
         if id_match:
-            search_id = id_match.group(1)
+            search_id = int(id_match.group(1))
             found_pigs = [pig for pig in self.pigsty.pigs if pig.id == search_id]
         elif args_text:
             kw = args_text.lower()
@@ -919,7 +917,7 @@ class RollPigPlugin(Star):
 
         if len(found_pigs) == 1:
             pig = found_pigs[0]
-            image_url = "https://pighub.top/data/" + pig.thumbnail.split("/")[-1]
+            image_url = "https://pighub.top" + pig.image_url
             yield event.chain_result(
                 [Comp.Plain(f"{pig.title} - {pig.id}\n"), Comp.Image.fromURL(image_url)]
             )
@@ -928,7 +926,7 @@ class RollPigPlugin(Star):
         # 多只猪，最多显示 20 只
         chain: list = []
         for pig in found_pigs[:20]:
-            image_url = "https://pighub.top/data/" + pig.thumbnail.split("/")[-1]
+            image_url = "https://pighub.top" + pig.image_url
             chain.append(Comp.Plain(f"{pig.title} - {pig.id}\n"))
             chain.append(Comp.Image.fromURL(image_url))
             chain.append(Comp.Plain("\n"))
